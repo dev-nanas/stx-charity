@@ -46,3 +46,114 @@
 (define-private (valid-donation-id? (donation-id uint))
   (<= donation-id (var-get latest-donation-id))
 )
+
+
+
+;; Public Functions
+
+;; Start a new donation escrow
+(define-public (create-donation (recipient principal) (amount uint) (milestones (list 5 uint)))
+  (let
+    (
+      (new-id (+ (var-get latest-donation-id) u1))
+      (expiry (+ block-height ESCROW_PERIOD))
+    )
+    (asserts! (> amount u0) ERROR_INVALID_AMOUNT)
+    (asserts! (valid-beneficiary? recipient) ERROR_INVALID_STEP)
+    (asserts! (> (len milestones) u0) ERROR_INVALID_STEP)
+    (match (stx-transfer? amount tx-sender (as-contract tx-sender))
+      success
+        (begin
+          (map-set DonationRecords
+            { id: new-id }
+            {
+              contributor: tx-sender,
+              beneficiary: recipient,
+              total-funds: amount,
+              current-status: "pending",
+              creation-block: block-height,
+              expiry-block: expiry,
+              milestone-schedule: milestones,
+              milestones-cleared: u0
+            }
+          )
+          (var-set latest-donation-id new-id)
+          (ok new-id)
+        )
+      error ERROR_TRANSFER_FAILED
+    )
+  )
+)
+
+;; Approve milestone and release funds
+(define-public (release-milestone (donation-id uint))
+  (begin
+    (asserts! (valid-donation-id? donation-id) ERROR_INVALID_ID)
+    (let
+      (
+        (donation (unwrap! (map-get? DonationRecords { id: donation-id }) ERROR_NO_ESCROW))
+        (steps (get milestone-schedule donation))
+        (approved-steps (get milestones-cleared donation))
+        (receiver (get beneficiary donation))
+        (full-amount (get total-funds donation))
+        (release-amount (/ full-amount (len steps)))
+      )
+      (asserts! (< approved-steps (len steps)) ERROR_FUNDS_RELEASED)
+      (asserts! (is-eq tx-sender CONTRACT_OWNER) ERROR_NOT_AUTHORIZED)
+      (match (stx-transfer? release-amount (as-contract tx-sender) receiver)
+        success
+          (begin
+            (map-set DonationRecords
+              { id: donation-id }
+              (merge donation { milestones-cleared: (+ approved-steps u1) })
+            )
+            (ok true)
+          )
+        error ERROR_TRANSFER_FAILED
+      )
+    )
+  )
+)
+
+;; Reclaim donation if escrow expired
+(define-public (claim-refund (donation-id uint))
+  (begin
+    (asserts! (valid-donation-id? donation-id) ERROR_INVALID_ID)
+    (let
+      (
+        (donation (unwrap! (map-get? DonationRecords { id: donation-id }) ERROR_NO_ESCROW))
+        (original-donor (get contributor donation))
+        (refund-amount (get total-funds donation))
+      )
+      (asserts! (is-eq tx-sender CONTRACT_OWNER) ERROR_NOT_AUTHORIZED)
+      (asserts! (> block-height (get expiry-block donation)) ERROR_ESCROW_EXPIRED)
+      (match (stx-transfer? refund-amount (as-contract tx-sender) original-donor)
+        success
+          (begin
+            (map-set DonationRecords
+              { id: donation-id }
+              (merge donation { current-status: "refunded" })
+            )
+            (ok true)
+          )
+        error ERROR_TRANSFER_FAILED
+      )
+    )
+  )
+)
+
+;; Retrieve details of a specific donation
+(define-read-only (fetch-donation (donation-id uint))
+  (begin
+    (asserts! (valid-donation-id? donation-id) ERROR_INVALID_ID)
+    (match (map-get? DonationRecords { id: donation-id })
+      donation (ok donation)
+      ERROR_NO_ESCROW
+    )
+  )
+)
+
+;; Get the most recent donation ID
+(define-read-only (latest-donation)
+  (ok (var-get latest-donation-id))
+)
